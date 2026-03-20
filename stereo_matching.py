@@ -117,12 +117,21 @@ class PairAccumulator:
                  inc_per_hit: float = 1.0,
                  dec_per_miss: float = 0.3,
                  decay: float = 0.98,
-                 unlock_score_thresh: float = 2.0):
+                 unlock_score_thresh: float = 2.0,
+                 max_score: float = 20.0,
+                 mutual_exclusion_penalty: float = 2.0,
+                 mutual_exclusion_min_ratio: float = 0.5):
         self.lock_score_thresh = lock_score_thresh
         self.inc_per_hit = inc_per_hit
         self.dec_per_miss = dec_per_miss
         self.decay = decay
         self.unlock_score_thresh = unlock_score_thresh
+        # Upper bound for a single pair's accumulated score
+        self.max_score = max_score
+        # Extra penalty applied to lower-ranked alternatives when mutual exclusion is enforced
+        self.mutual_exclusion_penalty = mutual_exclusion_penalty
+        # Only enforce mutual exclusion for pairs whose score exceeds this fraction of lock_score_thresh
+        self.mutual_exclusion_min_ratio = mutual_exclusion_min_ratio
 
         self.scores: Dict[Tuple[int, int], float] = defaultdict(float)
         self.locked_l2r: Dict[int, int] = {}
@@ -145,14 +154,14 @@ class PairAccumulator:
         """
         self.step_decay()
 
-        matched_set = set(matched_pairs)
-
-        # Reward hits
+        # Reward hits (capped at max_score to prevent unbounded growth)
         for l_id, r_id in matched_pairs:
-            self.scores[(l_id, r_id)] += self.inc_per_hit
+            self.scores[(l_id, r_id)] = min(
+                self.scores[(l_id, r_id)] + self.inc_per_hit,
+                self.max_score
+            )
 
         # Penalize alternatives for active tracks (softly)
-        # For each active left track, if it matched to some r, penalize other r with existing scores
         left_to_r = {l: r for l, r in matched_pairs}
         right_to_l = {r: l for l, r in matched_pairs}
 
@@ -161,6 +170,32 @@ class PairAccumulator:
                 self.scores[(l_id, r_id)] = max(0.0, sc - self.dec_per_miss)
             if r_id in right_to_l and right_to_l[r_id] != l_id:
                 self.scores[(l_id, r_id)] = max(0.0, self.scores[(l_id, r_id)] - self.dec_per_miss)
+
+        # Enforce mutual exclusion: when multiple right IDs compete for the same left ID
+        # (or vice versa), penalise the lower-scoring alternatives.
+        min_score_for_exclusion = self.lock_score_thresh * self.mutual_exclusion_min_ratio
+        left_groups: Dict[int, List[Tuple[int, float]]] = defaultdict(list)
+        right_groups: Dict[int, List[Tuple[int, float]]] = defaultdict(list)
+        for (l_id, r_id), sc in self.scores.items():
+            if sc > min_score_for_exclusion:
+                left_groups[l_id].append((r_id, sc))
+                right_groups[r_id].append((l_id, sc))
+
+        for l_id, candidates in left_groups.items():
+            if len(candidates) > 1:
+                candidates.sort(key=lambda x: -x[1])
+                for r_id, _ in candidates[1:]:
+                    self.scores[(l_id, r_id)] = max(
+                        0.0, self.scores[(l_id, r_id)] - self.mutual_exclusion_penalty
+                    )
+
+        for r_id, candidates in right_groups.items():
+            if len(candidates) > 1:
+                candidates.sort(key=lambda x: -x[1])
+                for l_id, _ in candidates[1:]:
+                    self.scores[(l_id, r_id)] = max(
+                        0.0, self.scores[(l_id, r_id)] - self.mutual_exclusion_penalty
+                    )
 
         # Locking logic: choose best for each left, require one-to-one
         # Build candidate list sorted by score desc
@@ -204,73 +239,191 @@ class EpipolarGatedMatcher:
                  w_epi: float = 0.75,
                  w_size: float = 0.10,
                  w_evt: float = 0.15,
-                 max_cost: float = 0.95):
+                 max_cost: float = 0.95,
+                 motion_penalty_thresh: float = 50.0,
+                 layer1_thresh_multiplier: float = 1.5,
+                 layer2_max_cost: float = 0.75,
+                 layer3_thresh_multiplier: float = 2.0):
         self.F = F.astype(np.float64)
         self.epipolar_thresh_px = float(epipolar_thresh_px)
         self.w_epi = float(w_epi)
         self.w_size = float(w_size)
         self.w_evt = float(w_evt)
         self.max_cost = float(max_cost)
+        # Pixel distance at which motion prediction penalty reaches maximum
+        self.motion_penalty_thresh = float(motion_penalty_thresh)
+        # Layer 1: retain locked pairs at this multiple of the base epipolar threshold
+        self.layer1_thresh_multiplier = float(layer1_thresh_multiplier)
+        # Layer 2: strict max assignment cost for new (non-locked) pairs
+        self.layer2_max_cost = float(layer2_max_cost)
+        # Layer 3: relaxed epipolar threshold multiplier for the fallback pass
+        self.layer3_thresh_multiplier = float(layer3_thresh_multiplier)
 
     @staticmethod
     def _bbox_area(b: Tuple[int, int, int, int]) -> float:
         x1, y1, x2, y2 = b
         return max(1.0, float((x2 - x1) * (y2 - y1)))
 
-    def compute_pair_cost(self, left: Observation, right: Observation) -> Tuple[float, float]:
+    def _compute_match_cost(self,
+                            left: Observation,
+                            right: Observation,
+                            pred_left: Optional[Tuple[float, float]],
+                            pred_right: Optional[Tuple[float, float]],
+                            epipolar_thresh: float) -> Tuple[float, float]:
         """
-        Returns (total_cost, epi_dist_px). total_cost in [0, +inf), lower better.
+        Compute match cost between left and right observations.
+
+        When motion predictions are available the weights shift to:
+            0.50 × epipolar + 0.15 × size + 0.15 × event + 0.20 × motion
+        Otherwise falls back to the instance weights (w_epi / w_size / w_evt).
+
+        Returns:
+            (total_cost, epi_dist_px)
         """
         d_epi = epipolar_distance_lr(self.F, left.centroid, right.centroid)
-        c_epi = min(d_epi / self.epipolar_thresh_px, 1.0)
+        c_epi = min(d_epi / epipolar_thresh, 1.0)
 
         # size/area similarity
         aL = self._bbox_area(left.bbox)
         aR = self._bbox_area(right.bbox)
-        c_size = min(abs(np.log(aL / aR)) / 1.5, 1.0)  # scale factor 1.5 is empirical
+        c_size = min(abs(np.log(aL / aR)) / 1.5, 1.0)
 
         # event count similarity
         eL = max(1.0, float(left.event_count))
         eR = max(1.0, float(right.event_count))
         c_evt = abs(eL - eR) / max(eL, eR)
 
-        total = self.w_epi * c_epi + self.w_size * c_size + self.w_evt * c_evt
+        # motion prediction penalty
+        c_motion = 0.0
+        motion_count = 0
+        if pred_left is not None:
+            dist_l = np.hypot(left.centroid[0] - pred_left[0],
+                              left.centroid[1] - pred_left[1])
+            c_motion += min(dist_l / self.motion_penalty_thresh, 1.0)
+            motion_count += 1
+        if pred_right is not None:
+            dist_r = np.hypot(right.centroid[0] - pred_right[0],
+                              right.centroid[1] - pred_right[1])
+            c_motion += min(dist_r / self.motion_penalty_thresh, 1.0)
+            motion_count += 1
+
+        if motion_count > 0:
+            c_motion /= motion_count
+            total = 0.50 * c_epi + 0.15 * c_size + 0.15 * c_evt + 0.20 * c_motion
+        else:
+            total = self.w_epi * c_epi + self.w_size * c_size + self.w_evt * c_evt
+
         return float(total), float(d_epi)
+
+    def compute_pair_cost(self, left: Observation, right: Observation) -> Tuple[float, float]:
+        """
+        Returns (total_cost, epi_dist_px). total_cost in [0, +inf), lower is better.
+        Uses the instance epipolar threshold and no motion prediction (backward-compatible).
+        """
+        return self._compute_match_cost(left, right, None, None, self.epipolar_thresh_px)
+
+    def _build_and_solve(self,
+                         left_obs: List[Observation],
+                         right_obs: List[Observation],
+                         left_predictions: Dict[int, Tuple[float, float]],
+                         right_predictions: Dict[int, Tuple[float, float]],
+                         epipolar_thresh: float,
+                         max_cost: float) -> List[Tuple[int, int]]:
+        """Build a cost matrix for the given subsets and solve the assignment problem."""
+        nL, nR = len(left_obs), len(right_obs)
+        cost = np.full((nL, nR), fill_value=1e6, dtype=np.float64)
+
+        for i, lo in enumerate(left_obs):
+            pred_l = left_predictions.get(lo.track_id)
+            for j, ro in enumerate(right_obs):
+                pred_r = right_predictions.get(ro.track_id)
+                total, d_epi = self._compute_match_cost(lo, ro, pred_l, pred_r,
+                                                        epipolar_thresh)
+                if d_epi <= epipolar_thresh:
+                    cost[i, j] = total
+
+        pairs_idx = hungarian_or_greedy(cost, max_cost=max_cost)
+        result: List[Tuple[int, int]] = []
+        for i, j in pairs_idx:
+            if cost[i, j] < 1e5:
+                result.append((left_obs[i].track_id, right_obs[j].track_id))
+        return result
 
     def match_frame(self,
                     left_obs: List[Observation],
                     right_obs: List[Observation],
-                    locked_l2r: Optional[Dict[int, int]] = None) -> List[Tuple[int, int]]:
+                    locked_l2r: Optional[Dict[int, int]] = None,
+                    left_predictions: Optional[Dict[int, Tuple[float, float]]] = None,
+                    right_predictions: Optional[Dict[int, Tuple[float, float]]] = None
+                    ) -> List[Tuple[int, int]]:
         """
-        Return list of (left_track_id, right_track_id) for this frame.
-        Uses one-to-one assignment with epipolar gating.
-        If a left track is locked, it will only consider its locked right (if present) unless that violates gating badly.
+        Return list of (left_track_id, right_track_id) matched pairs for this frame.
+
+        Implements a three-layer matching strategy:
+          Layer 1 – Retain existing locked pairs (epipolar threshold relaxed ×1.5).
+          Layer 2 – Strict new matching for unmatched observations (base threshold).
+          Layer 3 – Relaxed fallback for still-unmatched observations (threshold ×2.0).
+
+        Args:
+            left_obs: Active left-camera observations.
+            right_obs: Active right-camera observations.
+            locked_l2r: Existing locked left→right ID mapping from PairAccumulator.
+            left_predictions: Dict mapping left track_id → predicted (x, y) from Kalman filter.
+            right_predictions: Dict mapping right track_id → predicted (x, y) from Kalman filter.
         """
         if not left_obs or not right_obs:
             return []
 
         locked_l2r = locked_l2r or {}
+        left_predictions = left_predictions or {}
+        right_predictions = right_predictions or {}
 
-        # Build cost matrix
-        nL, nR = len(left_obs), len(right_obs)
-        cost = np.full((nL, nR), fill_value=1e6, dtype=np.float64)
-
-        for i, lo in enumerate(left_obs):
-            for j, ro in enumerate(right_obs):
-                # Respect locks: if lo is locked, only allow that ro
-                if lo.track_id in locked_l2r and locked_l2r[lo.track_id] != ro.track_id:
-                    continue
-
-                total, d_epi = self.compute_pair_cost(lo, ro)
-                # hard gate by epipolar distance
-                if d_epi <= self.epipolar_thresh_px:
-                    cost[i, j] = total
-
-        pairs_idx = hungarian_or_greedy(cost, max_cost=self.max_cost)
+        lo_by_id = {o.track_id: o for o in left_obs}
+        ro_by_id = {o.track_id: o for o in right_obs}
 
         matched_pairs: List[Tuple[int, int]] = []
-        for i, j in pairs_idx:
-            if cost[i, j] >= 1e5:
+        matched_l_ids: set = set()
+        matched_r_ids: set = set()
+
+        # ── Layer 1: maintain existing locked pairs with relaxed epipolar threshold ──
+        layer1_thresh = self.epipolar_thresh_px * self.layer1_thresh_multiplier
+        for l_id, r_id in locked_l2r.items():
+            lo = lo_by_id.get(l_id)
+            ro = ro_by_id.get(r_id)
+            if lo is None or ro is None:
                 continue
-            matched_pairs.append((left_obs[i].track_id, right_obs[j].track_id))
+            d_epi = epipolar_distance_lr(self.F, lo.centroid, ro.centroid)
+            if d_epi <= layer1_thresh:
+                matched_pairs.append((l_id, r_id))
+                matched_l_ids.add(l_id)
+                matched_r_ids.add(r_id)
+
+        # ── Layer 2: strict matching for unmatched observations ──
+        unmatched_l = [o for o in left_obs if o.track_id not in matched_l_ids]
+        unmatched_r = [o for o in right_obs if o.track_id not in matched_r_ids]
+        if unmatched_l and unmatched_r:
+            new_pairs = self._build_and_solve(
+                unmatched_l, unmatched_r,
+                left_predictions, right_predictions,
+                epipolar_thresh=self.epipolar_thresh_px,
+                max_cost=self.layer2_max_cost,
+            )
+            for l_id, r_id in new_pairs:
+                matched_pairs.append((l_id, r_id))
+                matched_l_ids.add(l_id)
+                matched_r_ids.add(r_id)
+
+        # ── Layer 3: relaxed fallback for remaining unmatched observations ──
+        unmatched_l = [o for o in left_obs if o.track_id not in matched_l_ids]
+        unmatched_r = [o for o in right_obs if o.track_id not in matched_r_ids]
+        if unmatched_l and unmatched_r:
+            new_pairs = self._build_and_solve(
+                unmatched_l, unmatched_r,
+                left_predictions, right_predictions,
+                epipolar_thresh=self.epipolar_thresh_px * self.layer3_thresh_multiplier,
+                max_cost=self.max_cost,
+            )
+            for l_id, r_id in new_pairs:
+                matched_pairs.append((l_id, r_id))
+
         return matched_pairs

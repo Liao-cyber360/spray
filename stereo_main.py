@@ -12,6 +12,7 @@ from stereo_matching import (
     fundamental_from_krt, Observation,
     EpipolarGatedMatcher, PairAccumulator
 )
+from kalman_filter import KalmanFilter2D
 
 # ================= 参数配置 =================
 INPUT_RAW_LEFT = r"E:\EVS\Date\1.18chuanjia\L\toreconL.raw"
@@ -45,6 +46,15 @@ W_EPI = 0.80
 W_SIZE = 0.08
 W_EVT = 0.12
 MAX_ASSIGN_COST = 0.90           # 越小越严格（推荐 0.8~0.95 试）
+
+# 卡尔曼滤波参数
+KF_PROCESS_NOISE = 0.01          # 过程噪声（越小越信任匀速假设）
+KF_MEASUREMENT_NOISE = 1.0       # 测量噪声（越大越信任预测）
+MOTION_PENALTY_THRESH = 50.0     # 运动预测惩罚距离阈值（像素）
+
+# 配对累积参数
+MAX_PAIR_SCORE = 20.0            # 单配对分数上界（防止无限增长）
+MUTUAL_EXCLUSION_PENALTY = 2.0   # 互斥惩罚系数
 
 # 在参数区新增
 OUTPUT_JSONL = "stereo_3d_tracks.jsonl"
@@ -137,7 +147,8 @@ def main():
         F=F,
         epipolar_thresh_px=EPIPOLAR_THRESH_PX,
         w_epi=W_EPI, w_size=W_SIZE, w_evt=W_EVT,
-        max_cost=MAX_ASSIGN_COST
+        max_cost=MAX_ASSIGN_COST,
+        motion_penalty_thresh=MOTION_PENALTY_THRESH,
     )
 
     accumulator = PairAccumulator(
@@ -145,11 +156,17 @@ def main():
         unlock_score_thresh=UNLOCK_SCORE_THRESH,
         inc_per_hit=INC_PER_HIT,
         dec_per_miss=DEC_PER_MISS,
-        decay=PAIR_DECAY
+        decay=PAIR_DECAY,
+        max_score=MAX_PAIR_SCORE,
+        mutual_exclusion_penalty=MUTUAL_EXCLUSION_PENALTY,
     )
 
     tracker_left = IOUTracker(start_id=1)
     tracker_right = IOUTracker(start_id=1)
+
+    # Kalman filters for left and right tracks (keyed by track_id)
+    kf_left: Dict[int, KalmanFilter2D] = {}
+    kf_right: Dict[int, KalmanFilter2D] = {}
 
     triangulator = StereoTriangulator(K_LEFT, K_RIGHT, R, T)
 
@@ -213,8 +230,56 @@ def main():
         obs_left = tracks_to_observations(tracks_left)
         obs_right = tracks_to_observations(tracks_right)
 
-        # Frame matching with epipolar gating (+ respect locks)
-        frame_pairs = matcher.match_frame(obs_left, obs_right, locked_l2r=accumulator.locked_l2r)
+        active_l_ids = {o.track_id for o in obs_left}
+        active_r_ids = {o.track_id for o in obs_right}
+
+        # Remove stale Kalman filters for tracks that have disappeared
+        for tid in list(kf_left.keys()):
+            if tid not in active_l_ids:
+                del kf_left[tid]
+        for tid in list(kf_right.keys()):
+            if tid not in active_r_ids:
+                del kf_right[tid]
+
+        # Predict next position for each active track; initialise KF on first appearance
+        left_predictions: Dict[int, Tuple[float, float]] = {}
+        for o in obs_left:
+            if o.track_id not in kf_left:
+                kf = KalmanFilter2D(process_noise=KF_PROCESS_NOISE,
+                                    measurement_noise=KF_MEASUREMENT_NOISE)
+                kf.initialize(o.centroid[0], o.centroid[1])
+                kf_left[o.track_id] = kf
+                # No prior motion info; use current position as prediction
+                left_predictions[o.track_id] = (o.centroid[0], o.centroid[1])
+            else:
+                left_predictions[o.track_id] = kf_left[o.track_id].predict()
+
+        right_predictions: Dict[int, Tuple[float, float]] = {}
+        for o in obs_right:
+            if o.track_id not in kf_right:
+                kf = KalmanFilter2D(process_noise=KF_PROCESS_NOISE,
+                                    measurement_noise=KF_MEASUREMENT_NOISE)
+                kf.initialize(o.centroid[0], o.centroid[1])
+                kf_right[o.track_id] = kf
+                right_predictions[o.track_id] = (o.centroid[0], o.centroid[1])
+            else:
+                right_predictions[o.track_id] = kf_right[o.track_id].predict()
+
+        # Frame matching with epipolar gating, locked pairs, and motion predictions
+        frame_pairs = matcher.match_frame(
+            obs_left, obs_right,
+            locked_l2r=accumulator.locked_l2r,
+            left_predictions=left_predictions,
+            right_predictions=right_predictions,
+        )
+
+        # Update Kalman filters with actual observed positions
+        for o in obs_left:
+            if o.track_id in kf_left:
+                kf_left[o.track_id].update(o.centroid[0], o.centroid[1])
+        for o in obs_right:
+            if o.track_id in kf_right:
+                kf_right[o.track_id].update(o.centroid[0], o.centroid[1])
 
         # Update accumulator / lock pairs over time
         accumulator.update_with_frame_matches(
